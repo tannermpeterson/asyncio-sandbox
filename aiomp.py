@@ -1,6 +1,8 @@
 import asyncio
-import aiomultiprocess
+from functools import wraps
 from queue import Empty
+
+import aiomultiprocess
 
 
 async def handle_user_input(subprocess_input_queue):
@@ -27,6 +29,13 @@ async def handle_user_input(subprocess_input_queue):
             print("ignoring input")
 
 
+class BreakLoop(Exception):
+    pass
+
+
+# TODO probably want to wrap into a class to handle shared state
+
+
 async def timer(time_remaining):
     """Start a countdown timer with the given number of seconds"""
     while time_remaining > 0:
@@ -36,40 +45,62 @@ async def timer(time_remaining):
     print("TIMER COMPLETE")
 
 
-async def handle_command(input_queue):
+def loop_until_break(func):
     """Wait for a command in the queue and then process it.
 
     Returns new tasks which should be awaited together.
     Includes itself in tasks unless quitting so that the next
     command can be processed.
     """
-    tasks = set()
 
-    # Regular mp queue is not awaitable and thus will block, so need to poll it then
-    # sleep to prevent blocking other coroutines. Should replace this with a
-    # process/thread safe + asyncio compatible queue
-    command_dict = None
-    while not command_dict:
-        try:
-            command_dict = input_queue.get_nowait()
-        except Empty:
-            await asyncio.sleep(0.01)
+    @wraps(func)
+    async def _foo(input_queue):
+        # Regular mp queue is not awaitable and thus will block, so need to poll it then
+        # sleep to prevent blocking other coroutines. Should replace this with a
+        # process/thread safe + asyncio compatible queue
+        command_dict = None
+        while not command_dict:
+            try:
+                command_dict = input_queue.get_nowait()
+            except Empty:
+                await asyncio.sleep(0.01)
+
+        tasks = func(command_dict) 
+        # add this function to new tasks so that another command can be processed
+        tasks.add(asyncio.create_task(_foo(input_queue)))
+        return tasks
+
+    return _foo
+
+
+@loop_until_break
+def handle_command(command_dict):
+    tasks = set()
 
     # process command
     command = command_dict["command"]
     if command == "quit":
-        return set()
-    elif command == "tanner":
+        raise BreakLoop()
+    if command == "tanner":
         print("that's my name")
     elif command == "start_timer":
-        tasks.add(asyncio.create_task(timer(command_dict["dur"])))
+        timer_task = asyncio.create_task(timer(command_dict["dur"]))
+        timer_task.set_name(f"Timer-{timer_task.get_name()}")
+        tasks.add(timer_task)
     else:
         print(f"unrecognized command: {command}")
 
-    # add this function to new tasks so that another command can be processed
-    tasks.add(asyncio.create_task(handle_command(input_queue)))
-
     return tasks
+
+
+async def cancel_remaining_tasks(remaining_tasks):
+    print("cancelling any remaining tasks")
+    for task in remaining_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.exceptions.CancelledError:
+            print(f"Cancelled task: {task.get_name()}")
 
 
 async def subprocess_main(input_queue):
@@ -78,15 +109,18 @@ async def subprocess_main(input_queue):
     Completed tasks may result in one or many new tasks being created.
     """
     pending = {asyncio.create_task(handle_command(input_queue))}
-    while True:
+    while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for coro in done:
-            if coro_result := coro.result():
-                for task in coro_result:
-                    pending.add(task)
-        if not pending:
-            print("subprocess quitting")
-            return
+            try:
+                new_tasks = coro.result()
+            except BreakLoop:
+                await cancel_remaining_tasks(pending)
+                pending.clear()
+            else:
+                if new_tasks:
+                    pending |= new_tasks
+    print("subprocess quitting")
 
 
 async def main():
