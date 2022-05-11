@@ -6,7 +6,7 @@ from queue import Empty
 async def handle_user_input(subprocess_input_queue):
     """Wait for user input and queue a command if applicable.
 
-    Entering 'quit' will break the loop and send queue tombstone message.
+    Entering 'quit' will break the loop and enqueue the tombstone message.
     """
     while True:
         user_input = input("enter: ")
@@ -49,7 +49,7 @@ async def handle_command(input_queue):
     # sleep to prevent blocking other coroutines. Should replace this with a
     # process/thread safe + asyncio compatible queue
     command_dict = None
-    while command_dict is None:
+    while not command_dict:
         try:
             command_dict = input_queue.get_nowait()
         except Empty:
@@ -81,11 +81,9 @@ async def subprocess_main(input_queue):
     while True:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for coro in done:
-            coro_result = coro.result()
-            if coro_result is None:
-                continue
-            for task in coro_result:
-                pending.add(task)
+            if coro_result := coro.result():
+                for task in coro_result:
+                    pending.add(task)
         if not pending:
             print("subprocess quitting")
             return
